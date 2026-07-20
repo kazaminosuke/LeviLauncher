@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.13] - 2026-06-26
+
+### Fixed
+
+- Fixed a crash on Minecraft Bedrock `1.26.31` by updating the bundled `vcruntime140_1.dll`.
+
+### CI
+
+- Fixed Windows build workflow configuration.
+
+### Chore
+
+- Bumped version to `0.3.13`.
+
+## [v0.3.12] - 2026-06-06
+
+### Added
+
+- Added a debug mode startup path for collecting richer launcher diagnostics.
+- Added a WebView2 runtime startup check before the launcher UI initializes.
+- Added editing support for normal mod metadata on the Mods page.
+
+### Changed
+
+- Updated Japanese localization coverage.
+
+### Fixed
+
+- Handled Visual C++ runtime startup installation failures more reliably.
+- Localized startup failure diagnostics shown before the launcher UI appears.
+- Allowed closing toast notifications from the launcher UI.
+
 ## [v0.3.11] - 2026-05-04
 
 ### Added

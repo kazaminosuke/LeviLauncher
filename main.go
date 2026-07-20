@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/liteldev/LeviLauncher/internal/update"
 	"github.com/liteldev/LeviLauncher/internal/vcruntime"
 	"github.com/liteldev/LeviLauncher/internal/versionlaunch"
+	"github.com/liteldev/LeviLauncher/internal/webview2runtime"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -50,24 +52,30 @@ var singleInstanceGuard win.Handle
 const singleInstancePipe = `\\.\pipe\LeviLauncher_SingleInstance_Pipe`
 
 const (
-	SW_RESTORE          = 9
-	MB_OK               = 0x00000000
-	MB_ICONERROR        = 0x00000010
-	minWindowWidth      = 960
-	minWindowHeight     = 600
-	defaultWindowWidth  = 1024
-	defaultWindowHeight = 640
+	ATTACH_PARENT_PROCESS = ^uint32(0)
+	CP_UTF8               = 65001
+	SW_RESTORE            = 9
+	MB_OK                 = 0x00000000
+	MB_ICONERROR          = 0x00000010
+	minWindowWidth        = 960
+	minWindowHeight       = 600
+	defaultWindowWidth    = 1024
+	defaultWindowHeight   = 640
 )
 
 var (
-	user32                  = win.NewLazySystemDLL("user32.dll")
-	procFindWindowW         = user32.NewProc("FindWindowW")
-	procMessageBoxW         = user32.NewProc("MessageBoxW")
-	procShowWindow          = user32.NewProc("ShowWindow")
-	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
+	kernel32                     = win.NewLazySystemDLL("kernel32.dll")
+	procAttachConsole            = kernel32.NewProc("AttachConsole")
+	procAllocConsole             = kernel32.NewProc("AllocConsole")
+	procGetUserDefaultUILanguage = kernel32.NewProc("GetUserDefaultUILanguage")
+	procSetConsoleOutputCP       = kernel32.NewProc("SetConsoleOutputCP")
+	procSetConsoleCP             = kernel32.NewProc("SetConsoleCP")
+	user32                       = win.NewLazySystemDLL("user32.dll")
+	procFindWindowW              = user32.NewProc("FindWindowW")
+	procMessageBoxW              = user32.NewProc("MessageBoxW")
+	procShowWindow               = user32.NewProc("ShowWindow")
+	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
 )
-
-const startupFailureDialogTitle = "LeviLauncher Startup Failed"
 
 type startupLogger struct {
 	start time.Time
@@ -85,20 +93,27 @@ type startupDiagnostics struct {
 	logPath         string
 	logFile         *os.File
 	logger          *slog.Logger
+	debugMode       bool
 	reportOnce      sync.Once
 	startupComplete atomic.Bool
 	showDialog      func(title string, message string)
 }
 
-func initStartupDiagnostics() *startupDiagnostics {
+func initStartupDiagnostics(debugMode bool) *startupDiagnostics {
 	logPath := apppath.StartupLogPath()
-	writers := []io.Writer{os.Stderr}
+	writers := []io.Writer{}
 
 	var logFile *os.File
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err == nil {
 		logFile = file
 		writers = append(writers, file)
+	}
+	if debugMode {
+		writers = append(writers, os.Stderr)
+	}
+	if len(writers) == 0 {
+		writers = append(writers, io.Discard)
 	}
 
 	logWriter := io.MultiWriter(writers...)
@@ -109,6 +124,7 @@ func initStartupDiagnostics() *startupDiagnostics {
 		logPath:    logPath,
 		logFile:    logFile,
 		logger:     slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		debugMode:  debugMode,
 		showDialog: showStartupFailureDialog,
 	}
 
@@ -165,7 +181,7 @@ func (s *startupDiagnostics) HandleError(source string, err error) {
 			return
 		}
 		s.flush()
-		s.showDialog(startupFailureDialogTitle, buildStartupFailureDialogMessage(s.logPath))
+		s.showDialog(startupFailureDialogTitle(), buildStartupFailureDialogMessage(s.logPath, s.debugMode))
 		s.flush()
 	})
 }
@@ -187,7 +203,7 @@ func (s *startupDiagnostics) HandlePanic(source string, err error, stackTrace st
 	}
 	s.reportOnce.Do(func() {
 		if s.showDialog != nil {
-			s.showDialog(startupFailureDialogTitle, buildStartupFailureDialogMessage(s.logPath))
+			s.showDialog(startupFailureDialogTitle(), buildStartupFailureDialogMessage(s.logPath, s.debugMode))
 		}
 		s.flush()
 	})
@@ -204,21 +220,42 @@ func (s *startupDiagnostics) logError(source string, err error) {
 	log.Printf("[startup] %s: %v", source, err)
 }
 
-func buildStartupFailureDialogMessage(logPath string) string {
+func isChineseWindowsUI() bool {
+	langID, _, err := procGetUserDefaultUILanguage.Call()
+	if langID == 0 || err != nil && err != syscall.Errno(0) {
+		return false
+	}
+	primaryLangID := uint16(langID) & 0x03ff
+	return primaryLangID == 0x04
+}
+
+func startupFailureDialogTitle() string {
+	if isChineseWindowsUI() {
+		return "LeviLauncher - 启动失败"
+	}
+	return "LeviLauncher - Startup Failed"
+}
+
+func buildStartupFailureDialogMessage(logPath string, debugMode bool) string {
 	if strings.TrimSpace(logPath) == "" {
 		logPath = "Unavailable"
 	}
-	return fmt.Sprintf(
-		"LeviLauncher failed to start.\n\nPlease retry. If it still closes immediately, open a GitHub issue and attach the startup log.\n\nLog path:\n%s",
-		logPath,
-	)
-}
-
-func defaultWebview2AdditionalBrowserArgs() []string {
-	return []string{
-		"--disable-gpu",
-		"--disable-gpu-compositing",
+	if debugMode {
+		if isChineseWindowsUI() {
+			return fmt.Sprintf(
+				"LeviLauncher 启动失败。\n\n调试模式已启用。请复制当前控制台输出，并在提交 GitHub issue 时附上 startup.log。\n\n日志路径:\n%s",
+				logPath,
+			)
+		}
+		return fmt.Sprintf(
+			"LeviLauncher failed to start.\n\nDebug mode is enabled. Please copy the current console output and attach startup.log when opening a GitHub issue.\n\nLog path:\n%s",
+			logPath,
+		)
 	}
+	if isChineseWindowsUI() {
+		return "LeviLauncher 启动失败。\n\n请从 PowerShell 或 Windows Terminal 使用 --debug 重新启动，以捕获控制台日志。\n\n命令行示例:\n.\\LeviLauncher.exe --debug\n\n也可以在快捷方式目标末尾追加 --debug。支持参数: debug, --debug, -debug, /debug。\n\n如果仍然失败，请在 GitHub issue 中附上控制台输出。"
+	}
+	return "LeviLauncher failed to start.\n\nRestart it from PowerShell or Windows Terminal with --debug to capture console logs.\n\nCommand-line example:\n.\\LeviLauncher.exe --debug\n\nYou can also append --debug to the shortcut Target. Supported arguments: debug, --debug, -debug, /debug.\n\nIf it still fails, attach the console output when opening a GitHub issue."
 }
 
 func panicErrorValue(v any) error {
@@ -256,8 +293,76 @@ func focusExistingWindow() {
 	}
 }
 
-func parseArgs() (initialURL string, autoLaunchVersion string, postUpdateRestart bool) {
+func isDebugArg(arg string) bool {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "debug", "-debug", "--debug", "/debug":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDebugModeRequested(args []string) bool {
+	for _, arg := range args {
+		if isDebugArg(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func attachOrAllocateConsole() error {
+	r1, _, attachErr := procAttachConsole.Call(uintptr(ATTACH_PARENT_PROCESS))
+	if r1 != 0 || attachErr == win.ERROR_ACCESS_DENIED {
+		return nil
+	}
+
+	r1, _, allocErr := procAllocConsole.Call()
+	if r1 != 0 {
+		return nil
+	}
+
+	return fmt.Errorf("AttachConsole failed: %v; AllocConsole failed: %v", attachErr, allocErr)
+}
+
+func redirectStandardStreamsToConsole() error {
+	stdout, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open CONOUT$ for stdout: %w", err)
+	}
+	stderr, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0)
+	if err != nil {
+		_ = stdout.Close()
+		return fmt.Errorf("open CONOUT$ for stderr: %w", err)
+	}
+	if stdin, err := os.OpenFile("CONIN$", os.O_RDONLY, 0); err == nil {
+		os.Stdin = stdin
+		_ = win.SetStdHandle(win.STD_INPUT_HANDLE, win.Handle(stdin.Fd()))
+		win.Stdin = win.Handle(stdin.Fd())
+	}
+
+	os.Stdout = stdout
+	os.Stderr = stderr
+	_ = win.SetStdHandle(win.STD_OUTPUT_HANDLE, win.Handle(stdout.Fd()))
+	_ = win.SetStdHandle(win.STD_ERROR_HANDLE, win.Handle(stderr.Fd()))
+	win.Stdout = win.Handle(stdout.Fd())
+	win.Stderr = win.Handle(stderr.Fd())
+	log.SetOutput(os.Stderr)
+	return nil
+}
+
+func enableDebugConsole() error {
+	if err := attachOrAllocateConsole(); err != nil {
+		return err
+	}
+	_, _, _ = procSetConsoleOutputCP.Call(uintptr(CP_UTF8))
+	_, _, _ = procSetConsoleCP.Call(uintptr(CP_UTF8))
+	return redirectStandardStreamsToConsole()
+}
+
+func parseArgs() (initialURL string, autoLaunchVersion string, postUpdateRestart bool, debugMode bool) {
 	initialURL = "/"
+	debugMode = isDebugModeRequested(os.Args[1:])
 	for _, arg := range os.Args[1:] {
 		if strings.HasPrefix(arg, "--self-update=") {
 			initialURL = "/#/updating"
@@ -273,7 +378,7 @@ func parseArgs() (initialURL string, autoLaunchVersion string, postUpdateRestart
 			autoLaunchVersion = v
 		}
 	}
-	return initialURL, autoLaunchVersion, postUpdateRestart
+	return initialURL, autoLaunchVersion, postUpdateRestart, debugMode
 }
 
 func sendLaunchToExistingInstance(version string) bool {
@@ -423,7 +528,24 @@ func init() {
 }
 
 func main() {
-	diagnostics := initStartupDiagnostics()
+	initialURL, autoLaunchVersion, postUpdateRestart, debugMode := parseArgs()
+	var debugConsoleErr error
+	if debugMode {
+		debugConsoleErr = enableDebugConsole()
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		if debugConsoleErr == nil {
+			log.Printf("[startup] debug console enabled")
+		}
+	}
+
+	if !vcruntime.EnsureStartupInteractive(context.Background()) {
+		return
+	}
+	if !webview2runtime.EnsureStartupInteractive(context.Background()) {
+		return
+	}
+
+	diagnostics := initStartupDiagnostics(debugMode)
 	defer diagnostics.Close()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -434,9 +556,17 @@ func main() {
 
 	startup := newStartupLogger()
 	startup.Mark("process start")
+	startup.Mark("VC runtime ready")
+	startup.Mark("WebView2 runtime ready")
+	if debugMode {
+		if debugConsoleErr != nil {
+			log.Printf("[startup] debug console setup failed: %v", debugConsoleErr)
+		} else {
+			log.Printf("[startup] debug mode requested")
+		}
+	}
 
 	_ = godotenv.Load()
-	initialURL, autoLaunchVersion, postUpdateRestart := parseArgs()
 
 	if !ensureSingleInstance(autoLaunchVersion, postUpdateRestart) {
 		return
@@ -465,9 +595,6 @@ func main() {
 		Description: "A Minecraft Launcher",
 		Logger:      diagnostics.Logger(),
 		LogLevel:    slog.LevelDebug,
-		Windows: application.WindowsOptions{
-			AdditionalBrowserArgs: defaultWebview2AdditionalBrowserArgs(),
-		},
 		ErrorHandler: func(err error) {
 			diagnostics.HandleError("Wails/WebView2 error", err)
 		},
